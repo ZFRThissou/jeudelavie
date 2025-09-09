@@ -1,0 +1,411 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Jeu de la Vie — 1000×1000 (canvas, sparse)</title>
+<style>
+  html,body{height:100%;margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,"Helvetica Neue",Arial;background:#0b0b0b;color:#eaeaea}
+  #topbar{display:flex;flex-wrap:wrap;gap:8px;padding:8px;background:#0f0f0f;border-bottom:1px solid #141414;align-items:center}
+  button,input,select{font-size:13px;padding:6px 8px;background:#1b1b1b;border:1px solid #272727;color:#eee;border-radius:6px}
+  #canvas-wrap{flex:1;display:flex;height:calc(100% - 56px);background:#0b0b0b;overflow:hidden}
+  canvas{background:#0b0b0b;display:block;margin:auto;cursor:crosshair}
+  .small{font-size:12px;color:#bdbdbd;margin-left:8px}
+  label{color:#ddd;display:inline-flex;align-items:center;gap:6px}
+</style>
+</head>
+<body>
+  <div id="topbar">
+    <button id="playPause">▶ Play</button>
+    <button id="step">Step</button>
+    <button id="clear">Clear</button>
+    <button id="rand">Random</button>
+
+    <label>Vitesse
+      <input id="speed" type="range" min="1" max="60" value="10" />
+    </label>
+
+    <label>Zoom
+      <input id="zoom" type="range" min="4" max="40" value="12" />
+    </label>
+
+    <label>Grille
+      <input id="showGrid" type="checkbox" checked/>
+    </label>
+
+    <label>Wrap
+      <input id="wrap" type="checkbox" />
+    </label>
+
+    <select id="mode">
+      <option value="pan">Pan / Draw (L=alive, R=erase)</option>
+      <option value="draw">Draw toggle</option>
+    </select>
+
+    <div class="small" id="info">Grille: 1000×1000 · Vivantes: 0 · Gén: 0 · Zoom: 12px</div>
+  </div>
+
+  <div id="canvas-wrap">
+    <canvas id="c"></canvas>
+  </div>
+
+<script>
+/*
+  Jeu de la Vie — sparse + canvas
+  Grille virtuelle: 1000 x 1000
+  Stocke uniquement les cellules vivantes dans un Set (index = r * W + c)
+  Rendu: seule la fenêtre visible est dessinée.
+*/
+
+const VIRTUAL_W = 1000;
+const VIRTUAL_H = 1000;
+
+const canvas = document.getElementById('c');
+const wrap = document.getElementById('canvas-wrap');
+const ctx = canvas.getContext('2d', { alpha:false });
+
+let canvasW = wrap.clientWidth;
+let canvasH = wrap.clientHeight;
+canvas.width = canvasW;
+canvas.height = canvasH;
+
+const infoDiv = document.getElementById('info');
+const playPauseBtn = document.getElementById('playPause');
+const stepBtn = document.getElementById('step');
+const clearBtn = document.getElementById('clear');
+const randBtn = document.getElementById('rand');
+const speedInput = document.getElementById('speed');
+const zoomInput = document.getElementById('zoom');
+const showGridCb = document.getElementById('showGrid');
+const wrapCb = document.getElementById('wrap');
+const modeSelect = document.getElementById('mode');
+
+let cellPixel = parseInt(zoomInput.value,10);
+let showGrid = showGridCb.checked;
+let wrapMode = wrapCb.checked;
+let running = false;
+let fps = parseInt(speedInput.value,10);
+let mode = modeSelect.value;
+let generation = 0;
+
+/* viewport top-left in grid coords (cells) */
+let viewCols = Math.ceil(canvasW / cellPixel);
+let viewRows = Math.ceil(canvasH / cellPixel);
+let viewX = Math.max(0, Math.floor((VIRTUAL_W - viewCols)/2));
+let viewY = Math.max(0, Math.floor((VIRTUAL_H - viewRows)/2));
+
+let isPanning = false;
+let lastPan = null;
+let leftDrawing = false;
+let rightErasing = false;
+
+let alive = new Set();
+
+const idx = (r,c) => r * VIRTUAL_W + c;
+const decIdx = i => [Math.floor(i / VIRTUAL_W), i % VIRTUAL_W];
+
+window.addEventListener('resize', () => {
+  canvasW = wrap.clientWidth;
+  canvasH = wrap.clientHeight;
+  canvas.width = canvasW;
+  canvas.height = canvasH;
+  viewCols = Math.ceil(canvasW / cellPixel);
+  viewRows = Math.ceil(canvasH / cellPixel);
+  draw();
+});
+
+function clampView(){
+  viewCols = Math.ceil(canvasW / cellPixel);
+  viewRows = Math.ceil(canvasH / cellPixel);
+  viewX = Math.max(0, Math.min(VIRTUAL_W - viewCols, viewX));
+  viewY = Math.max(0, Math.min(VIRTUAL_H - viewRows, viewY));
+}
+
+function draw(){
+  ctx.fillStyle = '#0b0b0b';
+  ctx.fillRect(0,0,canvas.width,canvas.height);
+
+  const cols = viewCols;
+  const rows = viewRows;
+
+  // draw alive cells in viewport
+  ctx.fillStyle = '#e6e6e6';
+  if (alive.size > 0) {
+    alive.forEach( id => {
+      const r = Math.floor(id / VIRTUAL_W);
+      const c = id % VIRTUAL_W;
+      const vx = c - viewX;
+      const vy = r - viewY;
+      if (vx >= 0 && vy >= 0 && vx < cols && vy < rows) {
+        ctx.fillRect(vx * cellPixel, vy * cellPixel, Math.max(1, cellPixel - 1), Math.max(1, cellPixel - 1));
+      }
+    });
+  }
+
+  // grid lines (if large enough)
+  if (showGrid && cellPixel >= 6) {
+    ctx.strokeStyle = 'rgba(255,255,255,0.04)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (let x = 0; x <= cols; x++) {
+      ctx.moveTo(x * cellPixel + 0.5, 0);
+      ctx.lineTo(x * cellPixel + 0.5, rows * cellPixel);
+    }
+    for (let y = 0; y <= rows; y++) {
+      ctx.moveTo(0, y * cellPixel + 0.5);
+      ctx.lineTo(cols * cellPixel, y * cellPixel + 0.5);
+    }
+    ctx.stroke();
+  }
+
+  infoDiv.textContent = `Grille: ${VIRTUAL_W}×${VIRTUAL_H} · Vivantes: ${alive.size} · Gén: ${generation} · Zoom: ${cellPixel}px`;
+}
+
+/* compute next generation */
+function step(){
+  const neighborCounts = new Map();
+
+  const inc = (r,c) => {
+    if (wrapMode) {
+      r = (r + VIRTUAL_H) % VIRTUAL_H;
+      c = (c + VIRTUAL_W) % VIRTUAL_W;
+    } else {
+      if (r < 0 || r >= VIRTUAL_H || c < 0 || c >= VIRTUAL_W) return;
+    }
+    const k = idx(r,c);
+    neighborCounts.set(k, (neighborCounts.get(k) || 0) + 1);
+  };
+
+  alive.forEach(a => {
+    const r = Math.floor(a / VIRTUAL_W);
+    const c = a % VIRTUAL_W;
+    for (let dr=-1; dr<=1; dr++){
+      for (let dc=-1; dc<=1; dc++){
+        if (dr===0 && dc===0) continue;
+        inc(r+dr, c+dc);
+      }
+    }
+  });
+
+  const newAlive = new Set();
+  neighborCounts.forEach((count, key) => {
+    const wasAlive = alive.has(key);
+    if (wasAlive) {
+      if (count === 2 || count === 3) newAlive.add(key);
+    } else {
+      if (count === 3) newAlive.add(key);
+    }
+  });
+
+  alive = newAlive;
+  generation++;
+  draw();
+}
+
+/* loop */
+let lastTick = performance.now();
+function loop(now){
+  if (running) {
+    const interval = 1000 / fps;
+    if (now - lastTick >= interval) {
+      step();
+      lastTick = now;
+    }
+  }
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+/* controls */
+playPauseBtn.addEventListener('click', () => {
+  running = !running;
+  playPauseBtn.textContent = running ? '⏸ Pause' : '▶ Play';
+});
+
+stepBtn.addEventListener('click', () => {
+  if (!running) step();
+});
+
+clearBtn.addEventListener('click', () => {
+  alive.clear();
+  generation = 0;
+  draw();
+});
+
+randBtn.addEventListener('click', () => {
+  // add a sparse random distribution across the whole grid
+  const amount = 4000; // ajustable
+  for (let i=0;i<amount;i++){
+    const r = Math.floor(Math.random()*VIRTUAL_H);
+    const c = Math.floor(Math.random()*VIRTUAL_W);
+    alive.add(idx(r,c));
+  }
+  draw();
+});
+
+speedInput.addEventListener('input', (e) => {
+  fps = parseInt(e.target.value,10);
+});
+
+zoomInput.addEventListener('input', (e) => {
+  cellPixel = parseInt(e.target.value,10);
+  // keep view centered roughly
+  const centerX = viewX + Math.floor(viewCols/2);
+  const centerY = viewY + Math.floor(viewRows/2);
+  viewCols = Math.ceil(canvasW / cellPixel);
+  viewRows = Math.ceil(canvasH / cellPixel);
+  viewX = Math.max(0, Math.min(VIRTUAL_W - viewCols, centerX - Math.floor(viewCols/2)));
+  viewY = Math.max(0, Math.min(VIRTUAL_H - viewRows, centerY - Math.floor(viewRows/2)));
+  clampView();
+  draw();
+});
+
+showGridCb.addEventListener('change', (e) => {
+  showGrid = e.target.checked;
+  draw();
+});
+
+wrapCb.addEventListener('change', (e) => {
+  wrapMode = e.target.checked;
+});
+
+modeSelect.addEventListener('change', (e) => {
+  mode = e.target.value;
+});
+
+/* mouse interactions: pan & draw */
+canvas.addEventListener('wheel', (ev) => {
+  ev.preventDefault();
+  // zoom with wheel (ctrl not required)
+  if (ev.deltaY < 0) {
+    cellPixel = Math.min(40, cellPixel + 1);
+  } else {
+    cellPixel = Math.max(4, cellPixel - 1);
+  }
+  zoomInput.value = cellPixel;
+  const mx = ev.offsetX, my = ev.offsetY;
+  const cx = viewX + Math.floor(mx / (cellPixel+0.0001));
+  const cy = viewY + Math.floor(my / (cellPixel+0.0001));
+  // recenter so that mouse stays near same cell
+  viewCols = Math.ceil(canvasW / cellPixel);
+  viewRows = Math.ceil(canvasH / cellPixel);
+  viewX = Math.max(0, Math.min(VIRTUAL_W - viewCols, cx - Math.floor(viewCols/2)));
+  viewY = Math.max(0, Math.min(VIRTUAL_H - viewRows, cy - Math.floor(viewRows/2)));
+  draw();
+}, { passive:false });
+
+canvas.addEventListener('mousedown', (ev) => {
+  if (mode === 'pan') {
+    if (ev.button === 1) { // middle click -> start pan
+      isPanning = true;
+      lastPan = {x: ev.clientX, y: ev.clientY};
+    } else if (ev.button === 0) { // left
+      leftDrawing = true;
+      handleDrawAt(ev.offsetX, ev.offsetY, true);
+    } else if (ev.button === 2) { // right
+      rightErasing = true;
+      handleDrawAt(ev.offsetX, ev.offsetY, false);
+    }
+  } else { // draw toggle
+    if (ev.button === 0) {
+      handleToggleAt(ev.offsetX, ev.offsetY);
+    } else if (ev.button === 2) {
+      handleToggleAt(ev.offsetX, ev.offsetY);
+    }
+  }
+});
+
+canvas.addEventListener('mousemove', (ev) => {
+  if (isPanning && lastPan) {
+    const dx = ev.clientX - lastPan.x;
+    const dy = ev.clientY - lastPan.y;
+    const cellDx = Math.round(-dx / cellPixel);
+    const cellDy = Math.round(-dy / cellPixel);
+    if (cellDx !== 0 || cellDy !== 0) {
+      viewX = Math.max(0, Math.min(VIRTUAL_W - viewCols, viewX + cellDx));
+      viewY = Math.max(0, Math.min(VIRTUAL_H - viewRows, viewY + cellDy));
+      lastPan = {x: ev.clientX, y: ev.clientY};
+      draw();
+    }
+  } else {
+    if (leftDrawing) handleDrawAt(ev.offsetX, ev.offsetY, true);
+    if (rightErasing) handleDrawAt(ev.offsetX, ev.offsetY, false);
+  }
+});
+
+canvas.addEventListener('mouseup', (ev) => {
+  isPanning = false;
+  lastPan = null;
+  leftDrawing = false;
+  rightErasing = false;
+});
+
+canvas.addEventListener('mouseleave', () => {
+  isPanning = false;
+  lastPan = null;
+  leftDrawing = false;
+  rightErasing = false;
+});
+
+// disable context menu on canvas
+canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+
+function handleDrawAt(px, py, makeAlive){
+  const c = viewX + Math.floor(px / cellPixel);
+  const r = viewY + Math.floor(py / cellPixel);
+  if (r < 0 || r >= VIRTUAL_H || c < 0 || c >= VIRTUAL_W) return;
+  const k = idx(r,c);
+  if (makeAlive) alive.add(k);
+  else alive.delete(k);
+  draw();
+}
+
+function handleToggleAt(px, py){
+  const c = viewX + Math.floor(px / cellPixel);
+  const r = viewY + Math.floor(py / cellPixel);
+  if (r < 0 || r >= VIRTUAL_H || c < 0 || c >= VIRTUAL_W) return;
+  const k = idx(r,c);
+  if (alive.has(k)) alive.delete(k);
+  else alive.add(k);
+  draw();
+}
+
+/* keyboard shortcuts */
+window.addEventListener('keydown', (e) => {
+  if (e.key === ' ') {
+    e.preventDefault();
+    running = !running;
+    playPauseBtn.textContent = running ? '⏸ Pause' : '▶ Play';
+  } else if (e.key === 'n' || e.key === 'N') {
+    if (!running) step();
+  } else if (e.key === 'c' || e.key === 'C') {
+    alive.clear(); generation = 0; draw();
+  } else if (e.key === 'r' || e.key === 'R') {
+    // quick small random (viewport)
+    for (let i=0;i<1000;i++){
+      const r = Math.floor(Math.random()*VIRTUAL_H);
+      const c = Math.floor(Math.random()*VIRTUAL_W);
+      alive.add(idx(r,c));
+    }
+    draw();
+  } else if (e.key === 'g' || e.key === 'G') {
+    showGridCb.checked = !showGridCb.checked;
+    showGrid = showGridCb.checked;
+    draw();
+  } else if (e.key === '+' || e.key === '=') {
+    cellPixel = Math.min(40, cellPixel + 1);
+    zoomInput.value = cellPixel;
+    draw();
+  } else if (e.key === '-') {
+    cellPixel = Math.max(4, cellPixel - 1);
+    zoomInput.value = cellPixel;
+    draw();
+  }
+});
+
+/* initial draw */
+clampView();
+draw();
+</script>
+</body>
+</html>
